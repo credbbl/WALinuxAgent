@@ -40,10 +40,10 @@ class DebianOSUtil(DefaultOSUtil):
         return shellutil.run("systemctl --job-mode=ignore-dependencies try-reload-or-restart ssh", chk_err=False)
 
     def stop_agent_service(self):
-        return shellutil.run("service azurelinuxagent stop", chk_err=False)
+        return shellutil.run("systemctl --job-mode=ignore-dependencies stop walinuxagent", chk_err=False)
 
     def start_agent_service(self):
-        return shellutil.run("service azurelinuxagent start", chk_err=False)
+        return shellutil.run("systemctl --job-mode=ignore-dependencies start walinuxagent", chk_err=False)
 
     def start_network(self):
         pass
