@@ -79,7 +79,6 @@ def run_get_output(cmd, chk_err=True, log_cmd=True):
         logger.verbose(u"Run '{0}'", cmd)
     try:
         output = subprocess.check_output(cmd,
-                                         stderr=subprocess.STDOUT,
                                          shell=True)
         output = ustr(output,
                       encoding='utf-8',

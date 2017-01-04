@@ -17,6 +17,7 @@
 
 import os
 import re
+import subprocess
 import sys
 import threading
 from time import sleep
@@ -87,9 +88,8 @@ class ResourceDiskHandler(object):
             logger.error("Failed to enable swap {0}", e)
 
     def reread_partition_table(self, device):
-        if shellutil.run("sfdisk -R {0}".format(device), chk_err=False):
-            shellutil.run("blockdev --rereadpt {0}".format(device),
-                          chk_err=False)
+        shellutil.run("blockdev --rereadpt {0}".format(device),
+                      chk_err=False)
 
     def mount_resource_disk(self, mount_point):
         device = self.osutil.device_for_ide_port(1)
@@ -116,7 +116,7 @@ class ResourceDiskHandler(object):
             raise ResourceDiskError(msg=msg, inner=ose)
 
         logger.info("Examining partition table")
-        ret = shellutil.run_get_output("parted {0} print".format(device))
+        ret = shellutil.run_get_output("blkid -o value -s PTTYPE {0}".format(device))
         if ret[0]:
             raise ResourceDiskError("Could not determine partition info for "
                                     "{0}: {1}".format(device, ret[1]))
@@ -126,8 +126,9 @@ class ResourceDiskHandler(object):
             force_option = 'f'
         mkfs_string = "mkfs.{0} -{2} {1}".format(self.fs, partition, force_option)
 
-        if "gpt" in ret[1]:
+        if ret[1].strip() == "gpt":
             logger.info("GPT detected, finding partitions")
+            ret = shellutil.run_get_output("parted {0} print".format(device))
             parts = [x for x in ret[1].split("\n") if
                      re.match("^\s*[0-9]+", x)]
             logger.info("Found {0} GPT partition(s).", len(parts))
@@ -144,17 +145,13 @@ class ResourceDiskHandler(object):
                 shellutil.run(mkfs_string)
         else:
             logger.info("GPT not detected, determining filesystem")
-            ret = self.change_partition_type(suppress_message=True, option_str="{0} 1 -n".format(device))
-            ptype = ret[1].strip()
-            if ptype == "7" and self.fs != "ntfs":
+            ret = shellutil.run_get_output("blkid -o value -s TYPE {0}".format(partition))
+            if ret[1].strip() == 'ntfs' and self.fs != 'ntfs':
                 logger.info("The partition is formatted with ntfs, updating "
                             "partition type to 83")
-                self.change_partition_type(suppress_message=False, option_str="{0} 1 83".format(device))
-                self.reread_partition_table(device)
+                subprocess.call(['sfdisk', '-c', '-f', device, '1', '83'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 logger.info("Format partition [{0}]", mkfs_string)
                 shellutil.run(mkfs_string)
-            else:
-                logger.info("The partition type is {0}", ptype)
 
         mount_options = conf.get_resourcedisk_mountoptions()
         mount_string = self.get_mount_string(mount_options,
@@ -207,34 +204,6 @@ class ResourceDiskHandler(object):
                     mount_point,
                     self.fs)
         return mount_point
-
-    def change_partition_type(self, suppress_message, option_str):
-        """
-            use sfdisk to change partition type.
-            First try with --part-type; if fails, fall back to -c
-        """
-
-        command_to_use = '--part-type'
-        input = "sfdisk {0} {1} {2}".format(command_to_use, '-f' if suppress_message else '', option_str)
-        err_code, output = shellutil.run_get_output(input, chk_err=False, log_cmd=True)
-
-        # fall back to -c
-        if err_code != 0:
-            logger.info("sfdisk with --part-type failed [{0}], retrying with -c", err_code)
-            command_to_use = '-c'
-            input = "sfdisk {0} {1} {2}".format(command_to_use, '-f' if suppress_message else '', option_str)
-            err_code, output = shellutil.run_get_output(input, log_cmd=True)
-
-        if err_code == 0:
-            logger.info('{0} succeeded',
-                        input)
-        else:
-            logger.error('{0} failed [{1}: {2}]',
-                         input,
-                         err_code,
-                         output)
-
-        return err_code, output
 
     @staticmethod
     def get_mount_string(mount_options, partition, mount_point):
