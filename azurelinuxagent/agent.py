@@ -116,6 +116,11 @@ class Agent(object):
         update_handler = get_update_handler()
         update_handler.run()
 
+    def resourcedisk(self):
+        from azurelinuxagent.daemon.resourcedisk import get_resourcedisk_handler
+        resourcedisk_handler = get_resourcedisk_handler()
+        resourcedisk_handler.run()
+
 def main(args=[]):
     """
     Parse command line arguments, exit with usage() on error.
@@ -145,6 +150,8 @@ def main(args=[]):
                 agent.daemon()
             elif command == "run-exthandlers":
                 agent.run_exthandlers()
+            elif command == "resourcedisk":
+                agent.resourcedisk()
         except Exception:
             logger.error(u"Failed to run '{0}': {1}",
                          command,
@@ -182,6 +189,8 @@ def parse_args(sys_args):
             cmd = "register-service"
         elif re.match("^([-/]*)run-exthandlers", a):
             cmd = "run-exthandlers"
+        elif re.match("^([-/]*)resourcedisk", a):
+            cmd = "resourcedisk"
         elif re.match("^([-/]*)version", a):
             cmd = "version"
         elif re.match("^([-/]*)verbose", a):
@@ -215,7 +224,7 @@ def usage():
     print((("usage: {0} [-verbose] [-force] [-help] "
            "-configuration-path:<path to configuration file>"
            "-provision|-deprovision[+user]|-register-service|-version|-daemon|-start|"
-           "-run-exthandlers]"
+           "-run-exthandlers|-resourcedisk]"
            "").format(sys.argv[0])))
     print("")
 
