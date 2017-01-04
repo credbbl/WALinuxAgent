@@ -172,6 +172,8 @@ def parse_args(sys_args):
             cmd = "deprovision+user"
         elif re.match("^([-/]*)deprovision", a):
             cmd = "deprovision"
+        elif re.match("^([-/]*)provision", a):
+            cmd = "provision"
         elif re.match("^([-/]*)daemon", a):
             cmd = "daemon"
         elif re.match("^([-/]*)start", a):
@@ -212,7 +214,7 @@ def usage():
     print("")
     print((("usage: {0} [-verbose] [-force] [-help] "
            "-configuration-path:<path to configuration file>"
-           "-deprovision[+user]|-register-service|-version|-daemon|-start|"
+           "-provision|-deprovision[+user]|-register-service|-version|-daemon|-start|"
            "-run-exthandlers]"
            "").format(sys.argv[0])))
     print("")
