@@ -25,7 +25,7 @@ import threading
 import azurelinuxagent.common.conf as conf
 import azurelinuxagent.common.logger as logger
 
-from azurelinuxagent.common.event import WALAEventOperation, add_event
+from azurelinuxagent.common.event import add_event, WALAEventOperation
 from azurelinuxagent.common.exception import EventError, ProtocolError, OSUtilError
 from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.osutil import get_osutil
@@ -162,7 +162,7 @@ class MonitorHandler(object):
 
             try:
                 event = parse_event(data_str)
-                event.parameters.extend(self.sysinfo)
+                self.add_sysinfo(event)
                 event_list.events.append(event)
             except (ValueError, ProtocolError) as e:
                 logger.warn("Failed to decode event file: {0}", e)
@@ -178,11 +178,11 @@ class MonitorHandler(object):
             logger.error("{0}", e)
 
     def daemon(self):
-        last_heartbeat = datetime.datetime.min
         period = datetime.timedelta(minutes=30)
+        last_heartbeat = datetime.datetime.utcnow() - period
         while True:
-            if (datetime.datetime.now() - last_heartbeat) > period:
-                last_heartbeat = datetime.datetime.now()
+            if datetime.datetime.utcnow() >= (last_heartbeat + period):
+                last_heartbeat = datetime.datetime.utcnow()
                 add_event(
                     op=WALAEventOperation.HeartBeat,
                     name=CURRENT_AGENT,
@@ -193,3 +193,13 @@ class MonitorHandler(object):
             except Exception as e:
                 logger.warn("Failed to send events: {0}", e)
             time.sleep(60)
+
+    def add_sysinfo(self, event):
+        sysinfo_names = [v.name for v in self.sysinfo]
+        for param in event.parameters:
+            if param.name in sysinfo_names:
+                logger.verbose("Remove existing event parameter: [{0}:{1}]",
+                               param.name,
+                               param.value)
+                event.parameters.remove(param)
+        event.parameters.extend(self.sysinfo)

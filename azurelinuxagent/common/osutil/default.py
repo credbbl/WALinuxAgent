@@ -18,6 +18,7 @@
 
 import multiprocessing
 import os
+import platform
 import re
 import shutil
 import socket
@@ -29,13 +30,15 @@ import fcntl
 import base64
 import glob
 import datetime
+
 import azurelinuxagent.common.logger as logger
 import azurelinuxagent.common.conf as conf
-from azurelinuxagent.common.exception import OSUtilError
-from azurelinuxagent.common.future import ustr
 import azurelinuxagent.common.utils.fileutil as fileutil
 import azurelinuxagent.common.utils.shellutil as shellutil
 import azurelinuxagent.common.utils.textutil as textutil
+
+from azurelinuxagent.common.exception import OSUtilError
+from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.utils.cryptutil import CryptUtil
 
 __RULES_FILES__ = [ "/lib/udev/rules.d/75-persistent-net-generator.rules",
@@ -47,14 +50,37 @@ for all distros. Each concrete distro classes could overwrite default behavior
 if needed.
 """
 
+DMIDECODE_CMD = 'dmidecode --string system-uuid'
+PRODUCT_ID_FILE = '/sys/class/dmi/id/product_uuid'
+UUID_PATTERN = re.compile(
+    '^\s*[A-F0-9]{8}(?:\-[A-F0-9]{4}){3}\-[A-F0-9]{12}\s*$',
+    re.IGNORECASE)
+
 class DefaultOSUtil(object):
 
     def __init__(self):
         self.agent_conf_file_path = '/etc/waagent.conf'
-        self.selinux=None
+        self.selinux = None
+        self.disable_route_warning = False
 
     def get_agent_conf_file_path(self):
         return self.agent_conf_file_path
+
+    def get_instance_id(self):
+        '''
+        Azure records a UUID as the instance ID
+        First check /sys/class/dmi/id/product_uuid.
+        If that is missing, then extracts from dmidecode
+        If nothing works (for old VMs), return the empty string
+        '''
+        if os.path.isfile(PRODUCT_ID_FILE):
+            return fileutil.read_file(PRODUCT_ID_FILE).strip()
+
+        rc, s = shellutil.run_get_output(DMIDECODE_CMD)
+        if rc != 0 or UUID_PATTERN.match(s) is None:
+            return ""
+
+        return s.strip()
 
     def get_userentry(self, username):
         try:
@@ -108,8 +134,8 @@ class DefaultOSUtil(object):
 
     def chpasswd(self, username, password, crypt_id=6, salt_len=10):
         if self.is_sys_user(username):
-            raise OSUtilError(("User {0} is a system user. "
-                               "Will not set passwd.").format(username))
+            raise OSUtilError(("User {0} is a system user, "
+                               "will not set password.").format(username))
         passwd_hash = textutil.gen_password_hash(password, crypt_id, salt_len)
         cmd = "usermod -p '{0}' {1}".format(passwd_hash, username)
         ret, output = shellutil.run_get_output(cmd, log_cmd=False)
@@ -271,46 +297,65 @@ class DefaultOSUtil(object):
                     .format("Disabled" if disable_password else "Enabled"))
         logger.info("Configured SSH client probing to keep connections alive.")
 
-
     def get_dvd_device(self, dev_dir='/dev'):
-        pattern=r'(sr[0-9]|hd[c-z]|cdrom[0-9]|cd[0-9])'
-        for dvd in [re.match(pattern, dev) for dev in os.listdir(dev_dir)]:
+        pattern = r'(sr[0-9]|hd[c-z]|cdrom[0-9]|cd[0-9])'
+        device_list = os.listdir(dev_dir)
+        for dvd in [re.match(pattern, dev) for dev in device_list]:
             if dvd is not None:
                 return "/dev/{0}".format(dvd.group(0))
-        raise OSUtilError("Failed to get dvd device")
+        inner_detail = "The following devices were found, but none matched " \
+                       "the pattern [{0}]: {1}\n".format(pattern, device_list)
+        raise OSUtilError(msg="Failed to get dvd device from {0}".format(dev_dir),
+                          inner=inner_detail)
 
-    def mount_dvd(self, max_retry=6, chk_err=True, dvd_device=None, mount_point=None):
+    def mount_dvd(self,
+                  max_retry=6,
+                  chk_err=True,
+                  dvd_device=None,
+                  mount_point=None,
+                  sleep_time=5):
         if dvd_device is None:
             dvd_device = self.get_dvd_device()
         if mount_point is None:
             mount_point = conf.get_dvd_mount_point()
-        mountlist = shellutil.run_get_output("mount")[1]
-        existing = self.get_mount_point(mountlist, dvd_device)
-        if existing is not None: #Already mounted
+        mount_list = shellutil.run_get_output("mount")[1]
+        existing = self.get_mount_point(mount_list, dvd_device)
+
+        if existing is not None:
+            # already mounted
             logger.info("{0} is already mounted at {1}", dvd_device, existing)
             return
+
         if not os.path.isdir(mount_point):
             os.makedirs(mount_point)
 
-        for retry in range(0, max_retry):
-            retcode = self.mount(dvd_device, mount_point, option="-o ro -t udf,iso9660",
-                                 chk_err=chk_err)
-            if retcode == 0:
+        err = ''
+        for retry in range(1, max_retry):
+            return_code, err = self.mount(dvd_device,
+                                          mount_point,
+                                          option="-o ro -t udf,iso9660",
+                                          chk_err=chk_err)
+            if return_code == 0:
                 logger.info("Successfully mounted dvd")
                 return
-            if retry < max_retry - 1:
-                logger.warn("Mount dvd failed: retry={0}, ret={1}", retry,
-                            retcode)
-                time.sleep(5)
+            else:
+                logger.warn(
+                    "Mounting dvd failed [retry {0}/{1}, sleeping {2} sec]",
+                    retry,
+                    max_retry - 1,
+                    sleep_time)
+                if retry < max_retry:
+                    time.sleep(sleep_time)
         if chk_err:
-            raise OSUtilError("Failed to mount dvd.")
+            raise OSUtilError("Failed to mount dvd device", inner=err)
 
     def umount_dvd(self, chk_err=True, mount_point=None):
         if mount_point is None:
             mount_point = conf.get_dvd_mount_point()
-        retcode = self.umount(mount_point, chk_err=chk_err)
-        if chk_err and retcode != 0:
-            raise OSUtilError("Failed to umount dvd.")
+        return_code = self.umount(mount_point, chk_err=chk_err)
+        if chk_err and return_code != 0:
+            raise OSUtilError("Failed to unmount dvd device at {0}",
+                              mount_point)
 
     def eject_dvd(self, chk_err=True):
         dvd = self.get_dvd_device()
@@ -354,7 +399,11 @@ class DefaultOSUtil(object):
 
     def mount(self, dvd, mount_point, option="", chk_err=True):
         cmd = "mount {0} {1} {2}".format(option, dvd, mount_point)
-        return shellutil.run_get_output(cmd, chk_err)[0]
+        retcode, err = shellutil.run_get_output(cmd, chk_err)
+        if retcode != 0:
+            detail = "[{0}] returned {1}: {2}".format(cmd, retcode, err)
+            err = detail
+        return retcode, err
 
     def umount(self, mount_point, chk_err=True):
         return shellutil.run("umount {0}".format(mount_point), chk_err=chk_err)
@@ -419,7 +468,12 @@ class DefaultOSUtil(object):
         """
         iface=''
         expected=16 # how many devices should I expect...
-        struct_size=40 # for 64bit the size is 40 bytes
+
+        # for 64bit the size is 40 bytes
+        # for 32bit the size is 32 bytes
+        python_arc = platform.architecture()[0]
+        struct_size = 32 if python_arc == '32bit' else 40
+
         sock = socket.socket(socket.AF_INET,
                              socket.SOCK_DGRAM,
                              socket.IPPROTO_UDP)
@@ -438,11 +492,12 @@ class DefaultOSUtil(object):
             iface=sock[i:i+16].split(b'\0', 1)[0]
             if len(iface) == 0 or self.is_loopback(iface) or iface != primary:
                 # test the next one
-                logger.info('interface [{0}] skipped'.format(iface))
+                if len(iface) != 0 and not self.disable_route_warning:
+                    logger.info('Interface [{0}] skipped'.format(iface))
                 continue
             else:
                 # use this one
-                logger.info('interface [{0}] selected'.format(iface))
+                logger.info('Interface [{0}] selected'.format(iface))
                 break
 
         return iface.decode('latin-1'), socket.inet_ntoa(sock[i+20:i+24])
@@ -470,7 +525,8 @@ class DefaultOSUtil(object):
         primary = None
         primary_metric = None
 
-        logger.info("examine /proc/net/route for primary interface")
+        if not self.disable_route_warning:
+            logger.info("Examine /proc/net/route for primary interface")
         with open('/proc/net/route') as routing_table:
             idx = 0
             for header in filter(lambda h: len(h) > 0, routing_table.readline().strip(" \n").split("\t")):
@@ -494,10 +550,18 @@ class DefaultOSUtil(object):
 
         if primary is None:
             primary = ''
-
-        logger.info('primary interface is [{0}]'.format(primary))
+            if not self.disable_route_warning:
+                with open('/proc/net/route') as routing_table_fh:
+                    routing_table_text = routing_table_fh.read()
+                    logger.warn('Could not determine primary interface, '
+                                'please ensure /proc/net/route is correct')
+                    logger.warn('Contents of /proc/net/route:\n{0}'.format(routing_table_text))
+                    logger.warn('Primary interface examination will retry silently')
+                    self.disable_route_warning = True
+        else:
+            logger.info('Primary interface is [{0}]'.format(primary))
+            self.disable_route_warning = False
         return primary
-
 
     def is_primary_interface(self, ifname):
         """
@@ -507,13 +571,14 @@ class DefaultOSUtil(object):
         """
         return self.get_primary_interface() == ifname
 
-
     def is_loopback(self, ifname):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         result = fcntl.ioctl(s.fileno(), 0x8913, struct.pack('256s', ifname[:15]))
         flags, = struct.unpack('H', result[16:18])
         isloopback = flags & 8 == 8
-        logger.info('interface [{0}] has flags [{1}], is loopback [{2}]'.format(ifname, flags, isloopback))
+        if not self.disable_route_warning:
+            logger.info('interface [{0}] has flags [{1}], '
+                        'is loopback [{2}]'.format(ifname, flags, isloopback))
         return isloopback
 
     def get_dhcp_lease_endpoint(self):
@@ -675,6 +740,7 @@ class DefaultOSUtil(object):
 
     def publish_hostname(self, hostname):
         self.set_dhcp_hostname(hostname)
+        self.set_hostname_record(hostname)
         ifname = self.get_if_name()
         self.restart_if(ifname)
 
@@ -725,21 +791,38 @@ class DefaultOSUtil(object):
             port_id = port_id - 2
         device = None
         path = "/sys/bus/vmbus/devices/"
-        for vmbus in os.listdir(path):
-            deviceid = fileutil.read_file(os.path.join(path, vmbus, "device_id"))
-            guid = deviceid.lstrip('{').split('-')
-            if guid[0] == g0 and guid[1] == "000" + ustr(port_id):
-                for root, dirs, files in os.walk(path + vmbus):
-                    if root.endswith("/block"):
-                        device = dirs[0]
-                        break
-                    else : #older distros
-                        for d in dirs:
-                            if ':' in d and "block" == d.split(':')[0]:
-                                device = d.split(':')[1]
-                                break
-                break
+        if os.path.exists(path):
+            for vmbus in os.listdir(path):
+                deviceid = fileutil.read_file(os.path.join(path, vmbus, "device_id"))
+                guid = deviceid.lstrip('{').split('-')
+                if guid[0] == g0 and guid[1] == "000" + ustr(port_id):
+                    for root, dirs, files in os.walk(path + vmbus):
+                        if root.endswith("/block"):
+                            device = dirs[0]
+                            break
+                        else : #older distros
+                            for d in dirs:
+                                if ':' in d and "block" == d.split(':')[0]:
+                                    device = d.split(':')[1]
+                                    break
+                    break
         return device
+
+    def set_hostname_record(self, hostname):
+        fileutil.write_file(conf.get_published_hostname(), contents=hostname)
+
+    def get_hostname_record(self):
+        hostname_record = conf.get_published_hostname()
+        if not os.path.exists(hostname_record):
+            # this file is created at provisioning time with agents >= 2.2.3
+            hostname = socket.gethostname()
+            logger.warn('Hostname record does not exist, '
+                        'creating [{0}] with hostname [{1}]',
+                        hostname_record,
+                        hostname)
+            self.set_hostname_record(hostname)
+        record = fileutil.read_file(hostname_record)
+        return record
 
     def del_account(self, username):
         if self.is_sys_user(username):
@@ -749,10 +832,10 @@ class DefaultOSUtil(object):
         self.conf_sudoer(username, remove=True)
 
     def decode_customdata(self, data):
-        return base64.b64decode(data)
+        return base64.b64decode(data).decode('utf-8')
 
     def get_total_mem(self):
-        # Get total memory in bytes and divide by 1024**2 to get the valu in MB.
+        # Get total memory in bytes and divide by 1024**2 to get the value in MB.
         return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**2)
 
     def get_processor_cores(self):

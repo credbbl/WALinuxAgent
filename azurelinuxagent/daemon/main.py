@@ -23,56 +23,64 @@ import time
 import traceback
 
 import azurelinuxagent.common.conf as conf
-import azurelinuxagent.common.event as event
-import azurelinuxagent.common.utils.fileutil as fileutil
 import azurelinuxagent.common.logger as logger
+import azurelinuxagent.common.utils.fileutil as fileutil
 
-from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.event import add_event, WALAEventOperation
-from azurelinuxagent.common.exception import ProtocolError
+from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.osutil import get_osutil
 from azurelinuxagent.common.protocol import get_protocol_util
-from azurelinuxagent.common.rdma import RDMADeviceHandler, setup_rdma_device
-from azurelinuxagent.common.utils.textutil import parse_doc, find, getattrib
-from azurelinuxagent.common.version import AGENT_LONG_NAME, AGENT_VERSION, \
-                                     DISTRO_NAME, DISTRO_VERSION, \
-                                     DISTRO_FULL_NAME, PY_VERSION_MAJOR, \
-                                     PY_VERSION_MINOR, PY_VERSION_MICRO
+from azurelinuxagent.common.protocol.wire import WireClient
+from azurelinuxagent.common.rdma import setup_rdma_device
+from azurelinuxagent.common.version import AGENT_NAME, AGENT_LONG_NAME, \
+    AGENT_VERSION, \
+    DISTRO_NAME, DISTRO_VERSION, PY_VERSION_MAJOR, PY_VERSION_MINOR, \
+    PY_VERSION_MICRO
 from azurelinuxagent.daemon.resourcedisk import get_resourcedisk_handler
 from azurelinuxagent.daemon.scvmm import get_scvmm_handler
+from azurelinuxagent.ga.update import get_update_handler
 from azurelinuxagent.pa.provision import get_provision_handler
 from azurelinuxagent.pa.rdma import get_rdma_handler
-from azurelinuxagent.ga.update import get_update_handler
+
+OPENSSL_FIPS_ENVIRONMENT = "OPENSSL_FIPS"
+
 
 def get_daemon_handler():
     return DaemonHandler()
+
 
 class DaemonHandler(object):
     """
     Main thread of daemon. It will invoke other threads to do actual work
     """
+
     def __init__(self):
         self.running = True
         self.osutil = get_osutil()
 
-    def run(self):
+    def run(self, child_args=None):
         logger.info("{0} Version:{1}", AGENT_LONG_NAME, AGENT_VERSION)
         logger.info("OS: {0} {1}", DISTRO_NAME, DISTRO_VERSION)
         logger.info("Python: {0}.{1}.{2}", PY_VERSION_MAJOR, PY_VERSION_MINOR,
-            PY_VERSION_MICRO)
+                    PY_VERSION_MICRO)
 
         self.check_pid()
 
+        # If FIPS is enabled, set the OpenSSL environment variable
+        # Note:
+        # -- Subprocesses inherit the current environment
+        if conf.get_fips_enabled():
+            os.environ[OPENSSL_FIPS_ENVIRONMENT] = '1'
+
         while self.running:
             try:
-                self.daemon()
+                self.daemon(child_args)
             except Exception as e:
                 err_msg = traceback.format_exc()
-                add_event("WALA", is_success=False, message=ustr(err_msg), 
+                add_event(name=AGENT_NAME, is_success=False, message=ustr(err_msg),
                           op=WALAEventOperation.UnhandledError)
                 logger.info("Sleep 15 seconds and restart daemon")
                 time.sleep(15)
-
 
     def check_pid(self):
         """Check whether daemon is already running"""
@@ -84,11 +92,11 @@ class DaemonHandler(object):
         if self.osutil.check_pid_alive(pid):
             logger.info("Daemon is already running: {0}", pid)
             sys.exit(0)
-            
+
         fileutil.write_file(pid_file, ustr(os.getpid()))
 
-    def daemon(self):
-        logger.info("Run daemon") 
+    def daemon(self, child_args=None):
+        logger.info("Run daemon")
 
         self.protocol_util = get_protocol_util()
         self.scvmm_handler = get_scvmm_handler()
@@ -120,11 +128,21 @@ class DaemonHandler(object):
 
             logger.info("RDMA capabilities are enabled in configuration")
             try:
+                # Ensure the most recent SharedConfig is available
+                # - Changes to RDMA state may not increment the goal state
+                #   incarnation number. A forced update ensures the most
+                #   current values.
+                protocol = self.protocol_util.get_protocol()
+                client = protocol.client
+                if client is None or type(client) is not WireClient:
+                    raise Exception("Attempt to setup RDMA without Wireserver")
+                client.update_goal_state(forced=True)
+
                 setup_rdma_device()
             except Exception as e:
                 logger.error("Error setting up rdma device: %s" % e)
         else:
             logger.info("RDMA capabilities are not enabled, skipping")
-        
+
         while self.running:
-            self.update_handler.run_latest()
+            self.update_handler.run_latest(child_args=child_args)

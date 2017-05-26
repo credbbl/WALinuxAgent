@@ -21,10 +21,14 @@
 Module agent
 """
 
+from __future__ import print_function
+
 import os
 import sys
 import re
 import subprocess
+import traceback
+
 import azurelinuxagent.common.logger as logger
 import azurelinuxagent.common.event as event
 import azurelinuxagent.common.conf as conf
@@ -35,17 +39,21 @@ from azurelinuxagent.common.version import AGENT_NAME, AGENT_LONG_VERSION, \
 from azurelinuxagent.common.osutil import get_osutil
 
 class Agent(object):
-    def __init__(self, verbose):
+    def __init__(self, verbose, conf_file_path=None):
         """
         Initialize agent running environment.
         """
+        self.conf_file_path = conf_file_path
         self.osutil = get_osutil()
+
         #Init stdout log
         level = logger.LogLevel.VERBOSE if verbose else logger.LogLevel.INFO
         logger.add_logger_appender(logger.AppenderType.STDOUT, level)
 
         #Init config
-        conf_file_path = self.osutil.get_agent_conf_file_path()
+        conf_file_path = self.conf_file_path \
+                if self.conf_file_path is not None \
+                    else self.osutil.get_agent_conf_file_path()
         conf.load_conf_from_file(conf_file_path)
 
         #Init log
@@ -65,9 +73,13 @@ class Agent(object):
         """
         Run agent daemon
         """
+        child_args = None \
+            if self.conf_file_path is None \
+                else "-configuration-path:{0}".format(self.conf_file_path)
+
         from azurelinuxagent.daemon import get_daemon_handler
         daemon_handler = get_daemon_handler()
-        daemon_handler.run()
+        daemon_handler.run(child_args=child_args)
 
     def provision(self):
         """
@@ -111,7 +123,7 @@ def main(args=[]):
     """
     if len(args) <= 0:
         args = sys.argv[1:]
-    command, force, verbose = parse_args(args)
+    command, force, verbose, conf_file_path = parse_args(args)
     if command == "version":
         version()
     elif command == "help":
@@ -120,7 +132,7 @@ def main(args=[]):
         start()
     else:
         try:
-            agent = Agent(verbose)
+            agent = Agent(verbose, conf_file_path=conf_file_path)
             if command == "deprovision+user":
                 agent.deprovision(force, deluser=True)
             elif command == "deprovision":
@@ -133,8 +145,10 @@ def main(args=[]):
                 agent.daemon()
             elif command == "run-exthandlers":
                 agent.run_exthandlers()
-        except Exception as e:
-            logger.error(u"Failed to run '{0}': {1}", command, e)
+        except Exception:
+            logger.error(u"Failed to run '{0}': {1}",
+                         command,
+                         traceback.format_exc())
 
 def parse_args(sys_args):
     """
@@ -143,8 +157,18 @@ def parse_args(sys_args):
     cmd = "help"
     force = False
     verbose = False
+    conf_file_path = None
     for a in sys_args:
-        if re.match("^([-/]*)deprovision\\+user", a):
+        m = re.match("^(?:[-/]*)configuration-path:([\w/\.\-_]+)", a)
+        if not m is None:
+            conf_file_path = m.group(1)
+            if not os.path.exists(conf_file_path):
+                print("Error: Configuration file {0} does not exist".format(
+                        conf_file_path), file=sys.stderr)
+                usage()
+                sys.exit(1)
+        
+        elif re.match("^([-/]*)deprovision\\+user", a):
             cmd = "deprovision+user"
         elif re.match("^([-/]*)deprovision", a):
             cmd = "deprovision"
@@ -167,7 +191,7 @@ def parse_args(sys_args):
         else:
             cmd = "help"
             break
-    return cmd, force, verbose
+    return cmd, force, verbose, conf_file_path
 
 def version():
     """
@@ -187,6 +211,7 @@ def usage():
     """
     print("")
     print((("usage: {0} [-verbose] [-force] [-help] "
+           "-configuration-path:<path to configuration file>"
            "-deprovision[+user]|-register-service|-version|-daemon|-start|"
            "-run-exthandlers]"
            "").format(sys.argv[0])))

@@ -67,8 +67,8 @@ class FreeBSDOSUtil(DefaultOSUtil):
 
     def chpasswd(self, username, password, crypt_id=6, salt_len=10):
         if self.is_sys_user(username):
-            raise OSUtilError(("User {0} is a system user. "
-                               "Will not set passwd.").format(username))
+            raise OSUtilError(("User {0} is a system user, "
+                               "will not set password.").format(username))
         passwd_hash = textutil.gen_password_hash(password, crypt_id, salt_len)
         cmd = "echo '{0}'|pw usermod {1} -H 0 ".format(passwd_hash, username)
         ret, output = shellutil.run_get_output(cmd, log_cmd=False)
@@ -77,7 +77,7 @@ class FreeBSDOSUtil(DefaultOSUtil):
                                "").format(username, output))
 
     def del_root_password(self):
-        err = shellutil.run('pw mod user root -w no')
+        err = shellutil.run('pw usermod root -h -')
         if err:
             raise OSUtilError("Failed to delete root password: Failed to update password database.")
 

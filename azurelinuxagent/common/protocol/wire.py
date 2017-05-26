@@ -21,16 +21,18 @@ import os
 import re
 import time
 import xml.sax.saxutils as saxutils
+
 import azurelinuxagent.common.conf as conf
-from azurelinuxagent.common.exception import ProtocolNotFoundError
-from azurelinuxagent.common.future import httpclient, bytebuffer
-from azurelinuxagent.common.utils.textutil import parse_doc, findall, find, \
-    findtext, getattrib, gettext, remove_bom, get_bytes_from_pem, parse_json
 import azurelinuxagent.common.utils.fileutil as fileutil
 import azurelinuxagent.common.utils.textutil as textutil
-from azurelinuxagent.common.utils.cryptutil import CryptUtil
-from azurelinuxagent.common.protocol.restapi import *
+
+from azurelinuxagent.common.exception import ProtocolNotFoundError
+from azurelinuxagent.common.future import httpclient, bytebuffer
 from azurelinuxagent.common.protocol.hostplugin import HostPluginProtocol
+from azurelinuxagent.common.protocol.restapi import *
+from azurelinuxagent.common.utils.cryptutil import CryptUtil
+from azurelinuxagent.common.utils.textutil import parse_doc, findall, find, \
+    findtext, getattrib, gettext, remove_bom, get_bytes_from_pem, parse_json
 
 VERSION_INFO_URI = "http://{0}/?comp=versions"
 GOAL_STATE_URI = "http://{0}/machine/?comp=goalstate"
@@ -250,6 +252,9 @@ def ga_status_to_v1(ga_status):
     v1_ga_status = {
         'version': ga_status.version,
         'status': ga_status.status,
+        'osversion': ga_status.osversion,
+        'osname': ga_status.osname,
+        'hostname': ga_status.hostname,
         'formattedMessage': formatted_msg
     }
     return v1_ga_status
@@ -338,7 +343,7 @@ def vm_status_to_v1(vm_status, ext_statuses):
         'handlerAggregateStatus': v1_handler_status_list
     }
     v1_vm_status = {
-        'version': '1.0',
+        'version': '1.1',
         'timestampUTC': timestamp,
         'aggregateStatus': v1_agg_status
     }
@@ -367,89 +372,75 @@ class StatusBlob(object):
 
     __storage_version__ = "2014-02-14"
 
-    def upload(self, url):
-        # TODO upload extension only if content has changed
-        logger.verbose("Upload status blob")
-        upload_successful = False
+    def prepare(self, blob_type):
+        logger.verbose("Prepare status blob")
         self.data = self.to_json()
-        self.type = self.get_blob_type(url)
+        self.type = blob_type
+
+    def upload(self, url):
         try:
+            if not self.type in ["BlockBlob", "PageBlob"]:
+                raise ProtocolError("Illegal blob type: {0}".format(self.type))
+
             if self.type == "BlockBlob":
                 self.put_block_blob(url, self.data)
-            elif self.type == "PageBlob":
-                self.put_page_blob(url, self.data)
             else:
-                raise ProtocolError("Unknown blob type: {0}".format(self.type))
-        except HttpError as e:
-            logger.warn("Initial upload failed [{0}]".format(e))
-        else:
-            logger.verbose("Uploading status blob succeeded")
-            upload_successful = True
-        return upload_successful
+                self.put_page_blob(url, self.data)
+            return True
 
-    def get_blob_type(self, url):
-        logger.verbose("Get blob type")
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            resp = self.client.call_storage_service(
-                restutil.http_head,
-                url,
-                {
-                    "x-ms-date": timestamp,
-                    "x-ms-version": self.__class__.__storage_version__
-                })
-        except HttpError as e:
-            raise ProtocolError("Failed to get status blob type: {0}", e)
+        except Exception as e:
+            logger.verbose("Initial status upload failed: {0}", e)
 
-        if resp is None or resp.status != httpclient.OK:
-            raise ProtocolError("Failed to get status blob type")
+        return False
 
-        blob_type = resp.getheader("x-ms-blob-type")
-        logger.verbose("Blob type: [{0}]", blob_type)
-        return blob_type
+    def get_block_blob_headers(self, blob_size):
+        return {
+            "Content-Length": ustr(blob_size),
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "x-ms-version": self.__class__.__storage_version__
+        }
 
     def put_block_blob(self, url, data):
         logger.verbose("Put block blob")
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        resp = self.client.call_storage_service(
-            restutil.http_put,
-            url,
-            data,
-            {
-                "x-ms-date": timestamp,
-                "x-ms-blob-type": "BlockBlob",
-                "Content-Length": ustr(len(data)),
-                "x-ms-version": self.__class__.__storage_version__
-            })
+        headers = self.get_block_blob_headers(len(data))
+        resp = self.client.call_storage_service(restutil.http_put, url, data, headers)
         if resp.status != httpclient.CREATED:
             raise UploadError(
                 "Failed to upload block blob: {0}".format(resp.status))
 
+    def get_page_blob_create_headers(self, blob_size):
+        return {
+            "Content-Length": "0",
+            "x-ms-blob-content-length": ustr(blob_size),
+            "x-ms-blob-type": "PageBlob",
+            "x-ms-date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "x-ms-version": self.__class__.__storage_version__
+        }
+
+    def get_page_blob_page_headers(self, start, end):
+        return {
+            "Content-Length": ustr(end - start),
+            "x-ms-date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "x-ms-range": "bytes={0}-{1}".format(start, end - 1),
+            "x-ms-page-write": "update",
+            "x-ms-version": self.__class__.__storage_version__
+        }
+
     def put_page_blob(self, url, data):
         logger.verbose("Put page blob")
 
-        # Convert string into bytes
+        # Convert string into bytes and align to 512 bytes
         data = bytearray(data, encoding='utf-8')
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-        # Align to 512 bytes
         page_blob_size = int((len(data) + 511) / 512) * 512
-        resp = self.client.call_storage_service(
-            restutil.http_put,
-            url,
-            "",
-            {
-                "x-ms-date": timestamp,
-                "x-ms-blob-type": "PageBlob",
-                "Content-Length": "0",
-                "x-ms-blob-content-length": ustr(page_blob_size),
-                "x-ms-version": self.__class__.__storage_version__
-            })
+
+        headers = self.get_page_blob_create_headers(page_blob_size)
+        resp = self.client.call_storage_service(restutil.http_put, url, "", headers)
         if resp.status != httpclient.CREATED:
             raise UploadError(
                 "Failed to clean up page blob: {0}".format(resp.status))
 
-        if url.count("?") < 0:
+        if url.count("?") <= 0:
             url = "{0}?comp=page".format(url)
         else:
             url = "{0}&comp=page".format(url)
@@ -466,17 +457,12 @@ class StatusBlob(object):
             buf_size = page_end - start
             buf = bytearray(buf_size)
             buf[0: content_size] = data[start: end]
+            headers = self.get_page_blob_page_headers(start, page_end)
             resp = self.client.call_storage_service(
                 restutil.http_put,
                 url,
                 bytebuffer(buf),
-                {
-                    "x-ms-date": timestamp,
-                    "x-ms-range": "bytes={0}-{1}".format(start, page_end - 1),
-                    "x-ms-page-write": "update",
-                    "x-ms-version": self.__class__.__storage_version__,
-                    "Content-Length": ustr(page_end - start)
-                })
+                headers)
             if resp is None or resp.status != httpclient.CREATED:
                 raise UploadError(
                     "Failed to upload page blob: {0}".format(resp.status))
@@ -526,7 +512,6 @@ class WireClient(object):
         self.req_count = 0
         self.host_plugin = None
         self.status_blob = StatusBlob(self)
-        self.status_blob_type_reported = False
 
     def prevent_throttling(self):
         """
@@ -631,19 +616,28 @@ class WireClient(object):
     def fetch_manifest(self, version_uris):
         logger.verbose("Fetch manifest")
         for version in version_uris:
-            response = self.fetch(version.uri)
+            response = None
+            if not HostPluginProtocol.is_default_channel():
+                response = self.fetch(version.uri)
             if not response:
-                logger.verbose("Manifest could not be downloaded, falling back to host plugin")
+                if HostPluginProtocol.is_default_channel():
+                    logger.verbose("Using host plugin as default channel")
+                else:
+                    logger.verbose("Manifest could not be downloaded, falling back to host plugin")
                 host = self.get_host_plugin()
                 uri, headers = host.get_artifact_request(version.uri)
                 response = self.fetch(uri, headers)
                 if not response:
+                    host = self.get_host_plugin(force_update=True)
                     logger.info("Retry fetch in {0} seconds",
-                                LONG_WAITING_INTERVAL)
-                    time.sleep(LONG_WAITING_INTERVAL)
+                                SHORT_WAITING_INTERVAL)
+                    time.sleep(SHORT_WAITING_INTERVAL)
                 else:
                     host.manifest_uri = version.uri
                     logger.verbose("Manifest downloaded successfully from host plugin")
+                    if not HostPluginProtocol.is_default_channel():
+                        logger.info("Setting host plugin as default channel")
+                        HostPluginProtocol.set_default_channel(True)
             if response:
                 return response
         raise ProtocolError("Failed to fetch manifest from all sources")
@@ -661,9 +655,9 @@ class WireClient(object):
             else:
                 logger.warn("Could not fetch {0} [{1}]",
                             uri,
-                            resp.status)
+                            HostPluginProtocol.read_response_error(resp))
         except (HttpError, ProtocolError) as e:
-            logger.verbose("Fetch failed from [{0}]", uri)
+            logger.verbose("Fetch failed from [{0}]: {1}", uri, e)
         return return_value
 
     def update_hosting_env(self, goal_state):
@@ -704,7 +698,6 @@ class WireClient(object):
         xml_text = self.fetch_config(goal_state.ext_uri, self.get_header())
         self.save_cache(local_file, xml_text)
         self.ext_conf = ExtensionsConfig(xml_text)
-        self.status_blob_type_reported = False
 
     def update_goal_state(self, forced=False, max_retry=3):
         uri = GOAL_STATE_URI.format(self.endpoint)
@@ -716,7 +709,7 @@ class WireClient(object):
 
         if not forced:
             last_incarnation = None
-            if (os.path.isfile(incarnation_file)):
+            if os.path.isfile(incarnation_file):
                 last_incarnation = fileutil.read_file(incarnation_file)
             new_incarnation = goal_state.incarnation
             if last_incarnation is not None and \
@@ -731,11 +724,11 @@ class WireClient(object):
                 file_name = GOAL_STATE_FILE_NAME.format(goal_state.incarnation)
                 goal_state_file = os.path.join(conf.get_lib_dir(), file_name)
                 self.save_cache(goal_state_file, xml_text)
-                self.save_cache(incarnation_file, goal_state.incarnation)
                 self.update_hosting_env(goal_state)
                 self.update_shared_conf(goal_state)
                 self.update_certs(goal_state)
                 self.update_ext_conf(goal_state)
+                self.save_cache(incarnation_file, goal_state.incarnation)
                 if self.host_plugin is not None:
                     self.host_plugin.container_id = goal_state.container_id
                     self.host_plugin.role_config_name = goal_state.role_config_name
@@ -760,7 +753,7 @@ class WireClient(object):
         return self.goal_state
 
     def get_hosting_env(self):
-        if (self.hosting_env is None):
+        if self.hosting_env is None:
             local_file = os.path.join(conf.get_lib_dir(),
                                       HOSTING_ENV_FILE_NAME)
             xml_text = self.fetch_cache(local_file)
@@ -768,7 +761,7 @@ class WireClient(object):
         return self.hosting_env
 
     def get_shared_conf(self):
-        if (self.shared_conf is None):
+        if self.shared_conf is None:
             local_file = os.path.join(conf.get_lib_dir(),
                                       SHARED_CONF_FILE_NAME)
             xml_text = self.fetch_cache(local_file)
@@ -776,7 +769,7 @@ class WireClient(object):
         return self.shared_conf
 
     def get_certs(self):
-        if (self.certs is None):
+        if self.certs is None:
             local_file = os.path.join(conf.get_lib_dir(), CERTS_FILE_NAME)
             xml_text = self.fetch_cache(local_file)
             self.certs = Certificates(self, xml_text)
@@ -794,7 +787,6 @@ class WireClient(object):
                 local_file = os.path.join(conf.get_lib_dir(), local_file)
                 xml_text = self.fetch_cache(local_file)
                 self.ext_conf = ExtensionsConfig(xml_text)
-                self.status_blob_type_reported = False
         return self.ext_conf
 
     def get_ext_manifest(self, ext_handler, goal_state):
@@ -823,7 +815,7 @@ class WireClient(object):
             logger.info("Wire protocol version:{0}", PROTOCOL_VERSION)
         elif PROTOCOL_VERSION in version_info.get_supported():
             logger.info("Wire protocol version:{0}", PROTOCOL_VERSION)
-            logger.warn("Server prefered version:{0}", preferred)
+            logger.warn("Server preferred version:{0}", preferred)
         else:
             error = ("Agent supported wire protocol version: {0} was not "
                      "advised by Fabric.").format(PROTOCOL_VERSION)
@@ -831,43 +823,37 @@ class WireClient(object):
 
     def upload_status_blob(self):
         ext_conf = self.get_ext_conf()
-        if ext_conf.status_upload_blob is not None:
-            uploaded = False
+
+        blob_uri = ext_conf.status_upload_blob
+        blob_type = ext_conf.status_upload_blob_type
+
+        if blob_uri is not None:
+
+            if not blob_type in ["BlockBlob", "PageBlob"]:
+                blob_type = "BlockBlob"
+                logger.info("Status Blob type is unspecified "
+                    "-- assuming it is a BlockBlob")
+
             try:
-                uploaded = self.status_blob.upload(ext_conf.status_upload_blob)
-                self.report_blob_type(self.status_blob.type,
-                                      ext_conf.status_upload_blob_type)
-            except (HttpError, ProtocolError) as e:
-                # errors have already been logged
-                pass
+                self.status_blob.prepare(blob_type)
+            except Exception as e:
+                self.report_status_event(
+                    "Exception creating status blob: {0}",
+                    e)
+                return
+
+            uploaded = False
+            if not HostPluginProtocol.is_default_channel():
+                try:
+                    uploaded = self.status_blob.upload(blob_uri)
+                except HttpError as e:
+                    pass
+
             if not uploaded:
                 host = self.get_host_plugin()
                 host.put_vm_status(self.status_blob,
                                    ext_conf.status_upload_blob,
                                    ext_conf.status_upload_blob_type)
-
-    """
-    Emit an event to determine if the type in the extension config
-    matches the actual type from the HTTP HEAD request.
-    """
-    def report_blob_type(self, head_type, config_type):
-        if head_type and config_type:
-            is_match = head_type == config_type
-            if self.status_blob_type_reported is False:
-                message = \
-                    'Blob type match [{0}]'.format(head_type) if is_match else \
-                    'Blob type mismatch [HEAD {0}], [CONFIG {1}]'.format(
-                        head_type,
-                        config_type)
-
-                from azurelinuxagent.common.event import add_event, WALAEventOperation
-                from azurelinuxagent.common.version import AGENT_NAME, CURRENT_VERSION
-                add_event(AGENT_NAME,
-                          version=CURRENT_VERSION,
-                          is_success=is_match,
-                          message=message,
-                          op=WALAEventOperation.HealthCheck)
-                self.status_blob_type_reported = True
 
     def report_role_prop(self, thumbprint):
         goal_state = self.get_goal_state()
@@ -957,6 +943,16 @@ class WireClient(object):
             if len(buf[provider_id]) > 0:
                 self.send_event(provider_id, buf[provider_id])
 
+    def report_status_event(self, message, *args):
+        from azurelinuxagent.common.event import report_event, \
+                WALAEventOperation
+
+        message = message.format(*args)
+        logger.warn(message)
+        report_event(op=WALAEventOperation.ReportStatus,
+                    is_success=False,
+                    message=message)
+
     def get_header(self):
         return {
             "x-ms-agent-name": "WALinuxAgent",
@@ -982,8 +978,12 @@ class WireClient(object):
             "x-ms-guest-agent-public-x509-cert": cert
         }
 
-    def get_host_plugin(self):
-        if self.host_plugin is None:
+    def get_host_plugin(self, force_update=False):
+        if self.host_plugin is None or force_update:
+            if force_update:
+                logger.warn("Forcing update of goal state")
+                self.goal_state = None
+                self.update_goal_state(forced=True)
             goal_state = self.get_goal_state()
             self.host_plugin = HostPluginProtocol(self.endpoint,
                                                   goal_state.container_id,
@@ -1402,7 +1402,6 @@ class InVMArtifactsProfile(object):
     * encryptedHealthChecks (optional)
     * encryptedApplicationProfile (optional)
     """
-
     def __init__(self, artifacts_profile):
         if not textutil.is_str_none_or_whitespace(artifacts_profile):
             self.__dict__.update(parse_json(artifacts_profile))

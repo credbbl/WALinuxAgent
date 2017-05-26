@@ -119,16 +119,20 @@ def rm_files(*args):
 
 def rm_dirs(*args):
     """
-    Remove all the contents under the directry
+    Remove the contents of each directry
     """
-    for dir_name in args:
-        if os.path.isdir(dir_name):
-            for item in os.listdir(dir_name):
-                path = os.path.join(dir_name, item)
-                if os.path.isfile(path):
-                    os.remove(path)
-                elif os.path.isdir(path):
-                    shutil.rmtree(path)
+    for p in args:
+        if not os.path.isdir(p):
+            continue
+
+        for pp in os.listdir(p):
+            path = os.path.join(p, pp)
+            if os.path.isfile(path):
+                os.remove(path)
+            elif os.path.islink(path):
+                os.unlink(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
 
 def trim_ext(path, ext):
     if not ext.startswith("."):
@@ -140,9 +144,9 @@ def update_conf_file(path, line_start, val, chk_err=False):
     if not os.path.isfile(path) and chk_err:
         raise IOError("Can't find config file:{0}".format(path))
     conf = read_file(path).split('\n')
-    conf = [x for x in conf if not x.startswith(line_start)]
+    conf = [x for x in conf if x is not None and len(x) > 0 and not x.startswith(line_start)]
     conf.append(val)
-    write_file(path, '\n'.join(conf))
+    write_file(path, '\n'.join(conf) + '\n')
 
 def search_file(target_dir_name, target_file_name):
     for root, dirs, files in os.walk(target_dir_name):

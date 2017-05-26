@@ -17,29 +17,14 @@
 
 from __future__ import print_function
 
-import copy
-import glob
-import json
-import mock
-import os
-import platform
-import random
-import subprocess
-import sys
-import tempfile
 import textwrap
-import zipfile
 
-from tests.protocol.mockwiredata import *
+import mock
+
+from azurelinuxagent.common.version import set_current_agent, \
+    AGENT_LONG_VERSION, AGENT_VERSION, AGENT_NAME, AGENT_NAME_PATTERN, \
+    get_f5_platform
 from tests.tools import *
-
-import azurelinuxagent.common.conf as conf
-import azurelinuxagent.common.logger as logger
-import azurelinuxagent.common.utils.fileutil as fileutil
-import azurelinuxagent.common.version as version
-
-from azurelinuxagent.common.utils.flexible_version import FlexibleVersion
-from azurelinuxagent.common.version import *
 
 
 class TestCurrentAgentName(AgentTestCase):
@@ -49,6 +34,22 @@ class TestCurrentAgentName(AgentTestCase):
 
     @patch("os.getcwd", return_value="/default/install/directory")
     def test_extract_name_finds_installed(self, mock_cwd):
+        current_agent, current_version = set_current_agent()
+        self.assertEqual(AGENT_LONG_VERSION, current_agent)
+        self.assertEqual(AGENT_VERSION, str(current_version))
+        return
+
+    @patch("os.getcwd", return_value="/")
+    def test_extract_name_root_finds_installed(self, mock_cwd):
+        current_agent, current_version = set_current_agent()
+        self.assertEqual(AGENT_LONG_VERSION, current_agent)
+        self.assertEqual(AGENT_VERSION, str(current_version))
+        return
+
+    @patch("os.getcwd")
+    def test_extract_name_in_path_finds_installed(self, mock_cwd):
+        path = os.path.join(conf.get_lib_dir(), "events")
+        mock_cwd.return_value = path
         current_agent, current_version = set_current_agent()
         self.assertEqual(AGENT_LONG_VERSION, current_agent)
         self.assertEqual(AGENT_VERSION, str(current_version))
@@ -67,6 +68,7 @@ class TestCurrentAgentName(AgentTestCase):
         self.assertEqual(version, str(current_version))
         return
 
+
 class TestGetF5Platforms(AgentTestCase):
     def test_get_f5_platform_bigip_12_1_1(self):
         version_file = textwrap.dedent("""
@@ -83,7 +85,7 @@ class TestGetF5Platforms(AgentTestCase):
 
         mo = mock.mock_open(read_data=version_file)
         with patch(open_patch(), mo):
-            platform = version.get_f5_platform()
+            platform = get_f5_platform()
             self.assertTrue(platform[0] == 'bigip')
             self.assertTrue(platform[1] == '12.1.1')
             self.assertTrue(platform[2] == 'bigip')
@@ -104,7 +106,7 @@ class TestGetF5Platforms(AgentTestCase):
 
         mo = mock.mock_open(read_data=version_file)
         with patch(open_patch(), mo):
-            platform = version.get_f5_platform()
+            platform = get_f5_platform()
             self.assertTrue(platform[0] == 'bigip')
             self.assertTrue(platform[1] == '12.1.0')
             self.assertTrue(platform[2] == 'bigip')
@@ -125,7 +127,7 @@ class TestGetF5Platforms(AgentTestCase):
 
         mo = mock.mock_open(read_data=version_file)
         with patch(open_patch(), mo):
-            platform = version.get_f5_platform()
+            platform = get_f5_platform()
             self.assertTrue(platform[0] == 'bigip')
             self.assertTrue(platform[1] == '12.0.0')
             self.assertTrue(platform[2] == 'bigip')
@@ -146,7 +148,7 @@ class TestGetF5Platforms(AgentTestCase):
 
         mo = mock.mock_open(read_data=version_file)
         with patch(open_patch(), mo):
-            platform = version.get_f5_platform()
+            platform = get_f5_platform()
             self.assertTrue(platform[0] == 'iworkflow')
             self.assertTrue(platform[1] == '2.0.1')
             self.assertTrue(platform[2] == 'iworkflow')
@@ -167,7 +169,7 @@ class TestGetF5Platforms(AgentTestCase):
 
         mo = mock.mock_open(read_data=version_file)
         with patch(open_patch(), mo):
-            platform = version.get_f5_platform()
+            platform = get_f5_platform()
             self.assertTrue(platform[0] == 'bigiq')
             self.assertTrue(platform[1] == '5.1.0')
             self.assertTrue(platform[2] == 'bigiq')

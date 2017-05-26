@@ -19,6 +19,8 @@ import os
 import re
 import sys
 import threading
+from time import sleep
+
 import azurelinuxagent.common.logger as logger
 from azurelinuxagent.common.future import ustr
 import azurelinuxagent.common.conf as conf
@@ -27,6 +29,7 @@ import azurelinuxagent.common.utils.fileutil as fileutil
 import azurelinuxagent.common.utils.shellutil as shellutil
 from azurelinuxagent.common.exception import ResourceDiskError
 from azurelinuxagent.common.osutil import get_osutil
+from azurelinuxagent.common.version import AGENT_NAME
 
 DATALOSS_WARNING_FILE_NAME = "DATALOSS_WARNING_README.txt"
 DATA_LOSS_WARNING = """\
@@ -72,7 +75,7 @@ class ResourceDiskHandler(object):
             return mount_point
         except ResourceDiskError as e:
             logger.error("Failed to mount resource disk {0}", e)
-            add_event(name="WALA", is_success=False, message=ustr(e),
+            add_event(name=AGENT_NAME, is_success=False, message=ustr(e),
                       op=WALAEventOperation.ActivateResourceDisk)
 
     def enable_swap(self, mount_point):
@@ -82,6 +85,11 @@ class ResourceDiskHandler(object):
             self.create_swap_space(mount_point, size_mb)
         except ResourceDiskError as e:
             logger.error("Failed to enable swap {0}", e)
+
+    def reread_partition_table(self, device):
+        if shellutil.run("sfdisk -R {0}".format(device), chk_err=False):
+            shellutil.run("blockdev --rereadpt {0}".format(device),
+                          chk_err=False)
 
     def mount_resource_disk(self, mount_point):
         device = self.osutil.device_for_ide_port(1)
@@ -99,7 +107,14 @@ class ResourceDiskHandler(object):
                         existing)
             return existing
 
-        fileutil.mkdir(mount_point, mode=0o755)
+        try:
+            fileutil.mkdir(mount_point, mode=0o755)
+        except OSError as ose:
+            msg = "Failed to create mount point " \
+                  "directory [{0}]: {1}".format(mount_point, ose)
+            logger.error(msg)
+            raise ResourceDiskError(msg=msg, inner=ose)
+
         logger.info("Examining partition table")
         ret = shellutil.run_get_output("parted {0} print".format(device))
         if ret[0]:
@@ -109,7 +124,7 @@ class ResourceDiskHandler(object):
         force_option = 'F'
         if self.fs == 'xfs':
             force_option = 'f'
-        mkfs_string = "mkfs.{0} {1} -{2}".format(self.fs, partition, force_option)
+        mkfs_string = "mkfs.{0} -{2} {1}".format(self.fs, partition, force_option)
 
         if "gpt" in ret[1]:
             logger.info("GPT detected, finding partitions")
@@ -129,12 +144,13 @@ class ResourceDiskHandler(object):
                 shellutil.run(mkfs_string)
         else:
             logger.info("GPT not detected, determining filesystem")
-            ret = self.change_partition_type(suppress_message=True, option_str="{0} 1".format(device))
+            ret = self.change_partition_type(suppress_message=True, option_str="{0} 1 -n".format(device))
             ptype = ret[1].strip()
             if ptype == "7" and self.fs != "ntfs":
                 logger.info("The partition is formatted with ntfs, updating "
                             "partition type to 83")
                 self.change_partition_type(suppress_message=False, option_str="{0} 1 83".format(device))
+                self.reread_partition_table(device)
                 logger.info("Format partition [{0}]", mkfs_string)
                 shellutil.run(mkfs_string)
             else:
@@ -144,9 +160,23 @@ class ResourceDiskHandler(object):
         mount_string = self.get_mount_string(mount_options,
                                              partition,
                                              mount_point)
+        attempts = 5
+        while not os.path.exists(partition) and attempts > 0:
+            logger.info("Waiting for partition [{0}], {1} attempts remaining",
+                        partition,
+                        attempts)
+            sleep(5)
+            attempts -= 1
+
+        if not os.path.exists(partition):
+            raise ResourceDiskError("Partition was not created [{0}]".format(partition))
+
         logger.info("Mount resource disk [{0}]", mount_string)
-        ret = shellutil.run(mount_string, chk_err=False)
-        if ret:
+        ret, output = shellutil.run_get_output(mount_string, chk_err=False)
+        # if the exit code is 32, then the resource disk can be already mounted
+        if ret == 32 and output.find("is already mounted") != -1:
+            logger.warn("Could not mount resource disk: {0}", output)
+        elif ret != 0:
             # Some kernels seem to issue an async partition re-read after a
             # 'parted' command invocation. This causes mount to fail if the
             # partition re-read is not complete by the time mount is
@@ -154,19 +184,23 @@ class ResourceDiskHandler(object):
             # the partition and try mounting.
             logger.warn("Failed to mount resource disk. "
                         "Retry mounting after re-reading partition info.")
-            if shellutil.run("sfdisk -R {0}".format(device), chk_err=False):
-                shellutil.run("blockdev --rereadpt {0}".format(device),
-                              chk_err=False)
-            ret = shellutil.run(mount_string, chk_err=False)
+
+            self.reread_partition_table(device)
+
+            ret, output = shellutil.run_get_output(mount_string)
             if ret:
                 logger.warn("Failed to mount resource disk. "
-                            "Attempting to format and retry mount.")
+                            "Attempting to format and retry mount. [{0}]",
+                            output)
+
                 shellutil.run(mkfs_string)
-                ret = shellutil.run(mount_string)
+                ret, output = shellutil.run_get_output(mount_string)
                 if ret:
                     raise ResourceDiskError("Could not mount {0} "
                                             "after syncing partition table: "
-                                            "{1}".format(partition, ret))
+                                            "[{1}] {2}".format(partition,
+                                                               ret,
+                                                               output))
 
         logger.info("Resource disk {0} is mounted at {1} with {2}",
                     device,
@@ -217,7 +251,9 @@ class ResourceDiskHandler(object):
         swapfile = os.path.join(mount_point, 'swapfile')
         swaplist = shellutil.run_get_output("swapon -s")[1]
 
-        if swapfile in swaplist and os.path.getsize(swapfile) == size:
+        if swapfile in swaplist \
+                and os.path.isfile(swapfile) \
+                and os.path.getsize(swapfile) == size:
             logger.info("Swap already enabled")
             return
 
@@ -253,8 +289,8 @@ class ResourceDiskHandler(object):
         if not isinstance(nbytes, int):
             nbytes = int(nbytes)
 
-        if nbytes < 0:
-            raise ValueError(nbytes)
+        if nbytes <= 0:
+            raise ResourceDiskError("Invalid swap size [{0}]".format(nbytes))
 
         if os.path.isfile(filename):
             os.remove(filename)
