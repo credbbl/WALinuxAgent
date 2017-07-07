@@ -133,6 +133,9 @@ class UpdateHandler(object):
         if child_args is not None:
             agent_cmd = "{0} {1}".format(agent_cmd, child_args)
 
+        env = os.environ.copy()
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
+
         try:
 
             # Launch the correct Python version for python-based agents
@@ -148,7 +151,7 @@ class UpdateHandler(object):
                 cwd=agent_dir,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
-                env=os.environ)
+                env=env)
 
             logger.verbose(u"Agent {0} launched with command '{1}'", agent_name, agent_cmd)
 
