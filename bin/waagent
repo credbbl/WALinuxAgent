@@ -40,8 +40,7 @@ if __name__ == 'waagent':
     """
     if sys.version_info[0] == 3:
         raise ImportError("waagent2.0 doesn't support python3")
-    bin_path = os.path.dirname(os.path.abspath(__file__))
-    agent20_path = os.path.join(bin_path, "waagent2.0")
+    agent20_path = os.path.join("/usr/lib/waagent/waagent2.0")
     if not os.path.isfile(agent20_path):
         raise ImportError("Can't load waagent")
     agent20 = imp.load_source('waagent', agent20_path)

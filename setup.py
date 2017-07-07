@@ -36,7 +36,12 @@ def set_files(data_files, dest=None, src=None):
 
 
 def set_bin_files(data_files, dest="/usr/sbin",
-                  src=["bin/waagent", "bin/waagent2.0"]):
+                  src=["bin/waagent"]):
+    data_files.append((dest, src))
+
+
+def set_lib_files(data_files, dest="/usr/lib/waagent",
+                  src=["bin/waagent2.0"]):
     data_files.append((dest, src))
 
 
@@ -147,6 +152,7 @@ def get_data_files(name, version, fullname):
     else:
         # Use default setting
         set_bin_files(data_files)
+        set_lib_files(data_files)
         set_conf_files(data_files)
         set_logrotate_files(data_files)
         set_udev_files(data_files)
